@@ -1,4 +1,2 @@
-/trained_models/*.npy
 /trained_models/*.pt
-/trained_models/**/*.npy
 /trained_models/**/*.pt
