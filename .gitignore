@@ -1,3 +1,2 @@
 /trained_models/*.pt
 /trained_models/**/*.pt
-/LLaMA-Factory/**
