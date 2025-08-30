@@ -20,7 +20,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 # === Project Modules ===
 from utils import distributed_log
-from data import get_metadata, get_dataset, fix_legacy_dict, skewed_mnist, SynthesizedDataset, leave_out_classes_random
+from data import get_metadata, get_dataset, fix_legacy_dict, skewed_mnist, SynthesizedDataset, leave_out_sample_random
 import unets
 
 
@@ -227,7 +227,7 @@ class GuassianDiffusion:
                 final = final.detach()
 
 
-def mc_nll(args, model, loader, diffusion, num_mc_samples=10, sampling_steps=250):
+def mc_nll(args, model, loader, diffusion, num_mc_samples, sampling_steps=250):
     model.to(args.device).eval()
     total_nll = 0.0
     total_samples = 0
@@ -605,7 +605,7 @@ def argument_parse():
     diffusion.add_argument("--arch", type=str, default="UNet", help="Neural network architecture to use")
     diffusion.add_argument("--class-cond", action="store_true", help="Enable class-conditioned diffusion")
     diffusion.add_argument("--diffusion-steps", type=int, default=1000, help="Total diffusion timesteps")
-    diffusion.add_argument("--sampling-steps", type=int, default=250, help="Steps for the sampling process")
+    diffusion.add_argument("--sampling-steps", type=int, default=10, help="Steps for the sampling process")
     diffusion.add_argument("--ddim", action="store_true", help="Use DDIM sampling instead of default")
 
     # === Dataset Settings ===
@@ -636,7 +636,8 @@ def argument_parse():
 
     # === Experiment Settings ===
     exp = parser.add_argument_group("Experiment")
-    exp.add_argument("--influence-sampling-time", type=int, default=50, help="Number of leave-out experiments to run")
+    exp.add_argument("--mc-sampling-time", type=int, default=100, help="Number of Monte Carlo sampling to calculate negative log-likelihood")
+    exp.add_argument("--influence-sampling-time", type=int, default=100, help="Number of leave-out experiments to run")
     exp.add_argument("--minority-classes", nargs="+", type=int, default=[0, 1, 2, 3, 4], help="List of minority classes for skewed datasets")
     exp.add_argument("--minority-count", type=int, default=100, help="Number of minority class samples")
     exp.add_argument("--majority-count", type=int, default=1000, help="Number of majority class samples")
@@ -666,26 +667,28 @@ def main():
     train_set, val_set = skewed_mnist(args, minority_classes=args.minority_classes, minority_count=args.minority_count, majority_count=args.majority_count, val_per_class=args.val_per_class)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    
-    leave_out_base = []
-    leave_out_syn = []
-    pbar = tqdm(total=args.influence_sampling_time, desc=f"{EXP_NAME} Influence Sampling") if args.local_rank == 0 else None
-    for _ in range(args.influence_sampling_time):
-        
-        if args.experiment_type == "skew_minor":
-            train_set_leave_out = leave_out_classes_random(train_set, leave_out_classes=args.minority_classes, max_per_class=50)
-        else:
-            train_set_leave_out = leave_out_classes_random(train_set, leave_out_classes=args.majority_classes, max_per_class=50)
 
-        # Create model and diffusion process
+    nll_base = [] # \theta_base
+    nll_syn = [] # \theta_final
+    leave_out_base = [] # \theta_base_z
+    leave_out_syn = [] # \theta_final_z
+    pbar = tqdm(total=args.influence_sampling_time, desc=f"{EXP_NAME} Influence Sampling") if args.local_rank == 0 else None
+    for i in range(args.influence_sampling_time):
+        # Set random seed for reproducibility
+        torch.manual_seed(args.seed + args.local_rank + i)
+        np.random.seed(args.seed + args.local_rank + i)
+        
+        ################### Experiment 1 ###################
+        
+        # \theta_base
         model_base = create_model(args, metadata)
         metadata.model_name = f"{args.arch}_{args.dataset}-timesteps_{args.diffusion_steps}-class_condn_{args.class_cond}-experiment-{args.experiment_type}_base"
         diffusion = GuassianDiffusion(args.diffusion_steps, args.device)
 
         model_base = DDP(model_base, device_ids=[args.local_rank], output_device=args.local_rank)
-        sampler = DistributedSampler(train_set_leave_out)
-        train_leave_out_loader = DataLoader(
-            train_set_leave_out,
+        sampler = DistributedSampler(train_set)
+        train_set_loader = DataLoader(
+            train_set,
             batch_size=args.batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
@@ -693,22 +696,24 @@ def main():
             pin_memory=True,
         )
 
-        distributed_log(args, f"Training dataset loaded: Number of batches: {len(train_leave_out_loader)}, Number of images: {len(train_set_leave_out)}")
+        distributed_log(args, f"Training dataset loaded: Number of batches: {len(train_set_loader)}, Number of images: {len(train_set)}")
 
-        logger = LossLogger(len(train_leave_out_loader) * args.epochs)
+        logger = LossLogger(len(train_set_loader) * args.epochs)
         args.ema_dict = copy.deepcopy(model_base.state_dict())
 
-        model_base = train_model(args, model_base, diffusion, train_leave_out_loader, sampler, metadata, logger)
+        # Train \theta_base
+        model_base = train_model(args, model_base, diffusion, train_set_loader, sampler, metadata, logger)
 
         distributed_log(args, "Training complete. Evaluating base model on MC NLL...")
-        mc_nll_base = mc_nll(args, model_base, val_loader, diffusion, sampling_steps=args.sampling_steps)
+        mc_nll_base = mc_nll(args, model_base, val_loader, diffusion, args.mc_sampling_time, sampling_steps=args.sampling_steps)
         distributed_log(args, f"MC NLL for base model: {mc_nll_base}")
-        leave_out_base.append(mc_nll_base)
-
+        print(f"MC NLL for base model: {mc_nll_base}")
+        nll_base.append(mc_nll_base)
+        
         ################### Train model with synthesized images ####################    
         # Synthesize images using the trained model
         syn_train_set, _ = sample_N_images(
-                                            N=len(train_set_leave_out),
+                                            N=len(train_set),
                                             model=model_base,
                                             diffusion=diffusion,
                                             xT=None,
@@ -720,10 +725,10 @@ def main():
                                             args=args,
                                         )
         
+        # \theta_final
         model_syn = create_model(args, metadata)
 
         syn_train_set = SynthesizedDataset(syn_train_set)
-
         
         metadata.model_name = f"{args.arch}_{args.dataset}-timesteps_{args.diffusion_steps}-class_condn_{args.class_cond}-experiment-{args.experiment_type}_syn"
         model_syn = DDP(model_syn, device_ids=[args.local_rank], output_device=args.local_rank)
@@ -743,10 +748,100 @@ def main():
         logger = LossLogger(len(syn_train_loader) * args.epochs)
         args.ema_dict = copy.deepcopy(model_syn.state_dict())
 
+        # Train \theta_final
         model_syn = train_model(args, model_syn, diffusion, syn_train_loader, sampler, metadata, logger)
 
         distributed_log(args, "Training complete. Evaluating synthetic model on MC NLL...")
-        mc_nll_syn = mc_nll(args, model_syn, val_loader, diffusion, sampling_steps=args.sampling_steps)
+        mc_nll_syn = mc_nll(args, model_syn, val_loader, diffusion, args.mc_sampling_time, sampling_steps=args.sampling_steps)
+        distributed_log(args, f"MC NLL for synthetic model: {mc_nll_syn}")
+        nll_syn.append(mc_nll_syn)
+
+        del model_base
+        del model_syn
+        del syn_train_set
+
+        ################### Experiment 2 ###################
+        # Create a leave-out dataset, D_z
+        if args.experiment_type == "skew_minor":
+            train_set_leave_out = leave_out_sample_random(train_set, leave_out_classes=args.minority_classes)
+        else:
+            train_set_leave_out = leave_out_sample_random(train_set, leave_out_classes=args.majority_classes)
+
+        # Initialize \theta_base_z
+        model_base_z = create_model(args, metadata)
+        metadata.model_name = f"{args.arch}_{args.dataset}-timesteps_{args.diffusion_steps}-class_condn_{args.class_cond}-experiment-{args.experiment_type}_base"
+        diffusion = GuassianDiffusion(args.diffusion_steps, args.device)
+
+        model_base_z = DDP(model_base_z, device_ids=[args.local_rank], output_device=args.local_rank)
+        sampler = DistributedSampler(train_set_leave_out)
+        train_leave_out_loader = DataLoader(
+            train_set_leave_out,
+            batch_size=args.batch_size,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            num_workers=4,
+            pin_memory=True,
+        )
+
+        distributed_log(args, f"Training dataset loaded: Number of batches: {len(train_leave_out_loader)}, Number of images: {len(train_set_leave_out)}")
+
+        logger = LossLogger(len(train_leave_out_loader) * args.epochs)
+        args.ema_dict = copy.deepcopy(model_base_z.state_dict())
+
+        # Train \theta_base_z
+        model_base_z = train_model(args, model_base_z, diffusion, train_leave_out_loader, sampler, metadata, logger)
+
+        distributed_log(args, "Training complete. Evaluating leave-out base model on MC NLL...")
+        mc_nll_base = mc_nll(args, model_base_z, val_loader, diffusion, args.mc_sampling_time, sampling_steps=args.sampling_steps)
+        distributed_log(args, f"MC NLL for base model: {mc_nll_base}")
+        leave_out_base.append(mc_nll_base)
+
+        dataset_size = len(train_set_leave_out)
+        del train_set_leave_out
+
+        ################### Train model with synthesized images ####################    
+        # Synthesize images using the trained model
+        syn_train_set_leave_out, _ = sample_N_images(
+                                            N=dataset_size,
+                                            model=model_base_z,
+                                            diffusion=diffusion,
+                                            xT=None,
+                                            sampling_steps=args.sampling_steps,
+                                            batch_size=args.batch_size,
+                                            num_channels=metadata.num_channels,
+                                            image_size=metadata.image_size,
+                                            num_classes=metadata.num_classes,
+                                            args=args,
+                                        )
+
+        # Initialize \theta_final_z
+        model_syn_z = create_model(args, metadata)
+
+        syn_train_set_leave_out = SynthesizedDataset(syn_train_set_leave_out)
+        
+        metadata.model_name = f"{args.arch}_{args.dataset}-timesteps_{args.diffusion_steps}-class_condn_{args.class_cond}-experiment-{args.experiment_type}_syn"
+        model_syn_z = DDP(model_syn_z, device_ids=[args.local_rank], output_device=args.local_rank)
+        sampler = DistributedSampler(syn_train_set_leave_out)
+        
+        syn_train_leave_out_loader = DataLoader(
+            syn_train_set_leave_out,
+            batch_size=args.batch_size,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            num_workers=4,
+            pin_memory=True,
+        )
+
+        distributed_log(args, f"Leave-out synthetic training dataset loaded: Number of batches: {len(syn_train_leave_out_loader)}, Number of images: {len(syn_train_set_leave_out)}")
+
+        logger = LossLogger(len(syn_train_leave_out_loader) * args.epochs)
+        args.ema_dict = copy.deepcopy(model_syn_z.state_dict())
+
+        # Train \theta_final_z
+        model_syn_z = train_model(args, model_syn_z, diffusion, syn_train_leave_out_loader, sampler, metadata, logger)
+
+        distributed_log(args, "Training complete. Evaluating leave-out synthetic model on MC NLL...")
+        mc_nll_syn = mc_nll(args, model_syn_z, val_loader, diffusion, args.mc_sampling_time, sampling_steps=args.sampling_steps)
         distributed_log(args, f"MC NLL for synthetic model: {mc_nll_syn}")
         leave_out_syn.append(mc_nll_syn)
 
@@ -757,20 +852,23 @@ def main():
         pbar.close()
 
     if args.local_rank == 0:
+        nll_base = np.array(nll_base)
+        nll_syn = np.array(nll_syn)
         leave_out_base = np.array(leave_out_base)
         leave_out_syn = np.array(leave_out_syn)
 
         # Save results
+        np.save(os.path.join(args.save_dir, f"base_{args.experiment_type}.npy"), nll_base)
+        np.save(os.path.join(args.save_dir, f"syn_{args.experiment_type}.npy"), nll_syn)
         np.save(os.path.join(args.save_dir, f"leave_out_base_{args.experiment_type}.npy"), leave_out_base)
         np.save(os.path.join(args.save_dir, f"leave_out_syn_{args.experiment_type}.npy"), leave_out_syn)
 
+        distributed_log(args, f"Base MC NLL {EXP_NAME} Group: {nll_base.mean():.4f} ± {nll_base.std():.4f}")
+        distributed_log(args, f"Synthetic MC NLL {EXP_NAME} Group: {nll_syn.mean():.4f} ± {nll_syn.std():.4f}")
         distributed_log(args, f"Leave-out base MC NLL {EXP_NAME} Group: {leave_out_base.mean():.4f} ± {leave_out_base.std():.4f}")
         distributed_log(args, f"Leave-out synthetic MC NLL {EXP_NAME} Group: {leave_out_syn.mean():.4f} ± {leave_out_syn.std():.4f}")
 
     dist.destroy_process_group()
-
-
-
 
 if __name__ == "__main__":
     main()

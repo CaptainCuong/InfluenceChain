@@ -405,6 +405,33 @@ def leave_out_classes_random(dataset, leave_out_classes, max_per_class=None, see
     return Subset(data_source, remaining_indices)
 
 
+def leave_out_sample_random(dataset, leave_out_classes):
+    """
+    Removes one random sample from the dataset, chosen among samples
+    whose label is in leave_out_classes.
+
+    Args:
+        dataset (Subset or Dataset): PyTorch dataset or subset.
+        leave_out_classes (list or set): Classes where a sample may be removed.
+
+    Returns:
+        Subset: New dataset with one sample removed.
+    """
+    # Find all indices belonging to leave_out_classes
+    candidate_indices = [i for i in range(len(dataset)) if dataset[i][1] in leave_out_classes]
+
+    if not candidate_indices:
+        raise ValueError("No samples found for the given leave_out_classes.")
+
+    # Randomly pick ONE sample to remove
+    index_to_remove = random.choice(candidate_indices)
+
+    # Keep all indices except the chosen one
+    remaining_indices = list(range(len(dataset)))
+    remaining_indices.remove(index_to_remove)
+
+    return Subset(dataset, remaining_indices)
+
 
 def remove_module(d):
     return OrderedDict({(k[len("module.") :], v) for (k, v) in d.items()})

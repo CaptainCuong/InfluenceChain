@@ -758,8 +758,8 @@ def main():
         np.save(os.path.join(args.save_dir, f"base_{args.experiment_type}.npy"), nll_base)
         np.save(os.path.join(args.save_dir, f"syn_{args.experiment_type}.npy"), nll_syn)
 
-        distributed_log(args, f"Leave-out base MC NLL {EXP_NAME} Group: {nll_base.mean():.4f} ± {nll_base.std():.4f}")
-        distributed_log(args, f"Leave-out synthetic MC NLL {EXP_NAME} Group: {nll_syn.mean():.4f} ± {nll_syn.std():.4f}")
+        distributed_log(args, f"Base MC NLL {EXP_NAME} Group: {nll_base.mean():.4f} ± {nll_base.std():.4f}")
+        distributed_log(args, f"Synthetic MC NLL {EXP_NAME} Group: {nll_syn.mean():.4f} ± {nll_syn.std():.4f}")
 
     dist.destroy_process_group()
 
